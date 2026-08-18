@@ -1,0 +1,57 @@
+[project]
+name = "forge"
+version = "0.1.0"
+description = "Forge — an open-source terminal-native autonomous software-engineering agent."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Tushar Umbarkar" }]
+keywords = ["agent", "llm", "cli", "coding-agent", "autonomous", "anthropic"]
+
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "anthropic>=0.39",
+    "pydantic>=2.7",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+forge = "forge.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/forge"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer uses function-call defaults (Option/Argument) by design.
+"src/forge/cli.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["forge"]
+mypy_path = "src"
+strict = true
+warn_unused_ignores = true

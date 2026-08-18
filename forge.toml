@@ -1,0 +1,25 @@
+# Forge project configuration (optional). Values here are overridden by
+# environment variables and CLI flags. Keys may be top-level or under [forge].
+
+[forge]
+# provider = "anthropic"
+# model = "claude-sonnet-4-5"
+# max_iterations = 25
+# shell_timeout = 120
+# auto_approve = false
+
+# Auto-approve tool calls whose target starts with one of these prefixes.
+# For shell, the target is the command; for file tools it is "<tool> <path>".
+allow = [
+    # "pytest",
+    # "uv run",
+    # "git status",
+    # "git diff",
+    # "write_file docs/",
+]
+
+# Extra deny patterns (matched as substrings). These EXTEND the built-in guards
+# (rm -rf /, sudo, git push, ...) and always win over allow rules.
+deny = [
+    # "git commit",
+]
