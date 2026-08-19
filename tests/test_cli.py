@@ -144,8 +144,45 @@ def test_config_json_reports_the_resolved_settings(workspace: Path) -> None:
     assert payload["workspace_root"] == str(workspace)
     assert payload["approval_mode"] == "auto"
     assert payload["sandbox"] == "none"
-    assert payload["credential"] == "MISSING"
-    assert payload["model"] == "(unset)"
+    assert payload["credential"] == "missing"
+    assert payload["model"] is None
+
+
+def test_config_json_is_typed_not_display_formatted(workspace: Path) -> None:
+    """--json is a machine contract: numbers stay numbers, absences are null.
+
+    The table rendering formats the same settings for humans ("150,000", "120s",
+    "enabled"). Those must never leak into the JSON payload, and no key may
+    contain a space.
+    """
+    payload = parse_json(invoke("-C", str(workspace), "--json", "config").output)
+
+    for key in (
+        "max_iterations",
+        "max_tokens",
+        "max_context_tokens",
+        "shell_timeout_s",
+        "allow_rules",
+        "deny_rules",
+        "destructive_rules",
+    ):
+        assert isinstance(payload[key], int), f"{key} should be an int, got {payload[key]!r}"
+
+    assert isinstance(payload["git_tools"], bool)
+    # Absent optional values are null, not a "(unset)"-style sentinel.
+    assert payload["base_url"] is None
+    assert not any(" " in key for key in payload), f"spaces in keys: {list(payload)}"
+    # No thousands separator or unit suffix survived into the payload.
+    serialized = json.dumps(payload)
+    assert "150,000" not in serialized
+    assert "120s" not in serialized
+
+
+def test_config_table_keeps_the_human_formatting(workspace: Path) -> None:
+    """The non-JSON view is still allowed to be pretty."""
+    output = invoke("-C", str(workspace), "config").output
+    assert "150,000" in output
+    assert "120s" in output
 
 
 def test_config_redacts_the_credential(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,7 +209,7 @@ def test_cli_flags_reach_the_resolved_config(workspace: Path) -> None:
     )
     payload = parse_json(result.output)
     assert payload["approval_mode"] == "yolo"
-    assert payload["max_iterations"] == "5"
+    assert payload["max_iterations"] == 5
     assert payload["model"] == "claude-x"
 
 

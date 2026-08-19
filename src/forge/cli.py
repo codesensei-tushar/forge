@@ -192,11 +192,41 @@ def config(ctx: typer.Context) -> None:
     """Show the resolved configuration (secrets redacted)."""
     state: CLIState = ctx.obj
     s = state.settings
+    has_credential = bool(s.auth_token or s.api_key)
+
+    if state.as_json:
+        # Typed payload, deliberately not the display rows below: counts and
+        # limits stay JSON numbers, absent values are null rather than a
+        # sentinel string, and no key contains a space. A consumer should never
+        # have to parse "150,000" or "120s" back into an int.
+        payload: dict[str, Any] = {
+            "provider": s.provider,
+            "model": s.model,
+            "base_url": s.base_url,
+            "credential": "set" if has_credential else "missing",
+            "workspace_root": str(s.workspace_root),
+            "approval_mode": s.approval_mode.value,
+            "sandbox": s.sandbox.value,
+            "max_iterations": s.max_iterations,
+            "max_tokens": s.max_tokens,
+            "max_context_tokens": s.max_context_tokens,
+            "shell_timeout_s": s.shell_timeout,
+            "git_tools": s.enable_git_tools,
+            "allow_rules": len(s.allow),
+            "deny_rules": len(s.deny),
+            "destructive_rules": len(s.destructive),
+            "log_level": s.log_level,
+        }
+        state.console.print_raw(json.dumps(payload, indent=2))
+        return
+
+    from rich.table import Table
+
     rows: list[tuple[str, str]] = [
         ("provider", s.provider),
         ("model", s.model or "(unset)"),
         ("base_url", s.base_url or "(provider default)"),
-        ("credential", "set" if (s.auth_token or s.api_key) else "MISSING"),
+        ("credential", "set" if has_credential else "MISSING"),
         ("workspace_root", str(s.workspace_root)),
         ("approval_mode", s.approval_mode.value),
         ("sandbox", s.sandbox.value),
@@ -210,12 +240,6 @@ def config(ctx: typer.Context) -> None:
         ("destructive rules", str(len(s.destructive))),
         ("log_level", s.log_level),
     ]
-
-    if state.as_json:
-        state.console.print_raw(json.dumps(dict(rows), indent=2))
-        return
-
-    from rich.table import Table
 
     table = Table(title="Forge configuration", title_justify="left", show_header=False)
     table.add_column(style="dim", justify="right")
