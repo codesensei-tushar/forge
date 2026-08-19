@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from forge.config import Settings
-from forge.models.base import FakeProvider, ModelProvider
+from forge.providers.base import FakeProvider, ModelProvider
+
+SUPPORTED_PROVIDERS: tuple[str, ...] = ("anthropic", "fake")
 
 
 def create_provider(settings: Settings) -> ModelProvider:
@@ -18,21 +20,22 @@ def create_provider(settings: Settings) -> ModelProvider:
     if provider == "anthropic":
         if not settings.model:
             raise ValueError(
-                "No model configured. Set ANTHROPIC_MODEL / FORGE_MODEL, "
-                "or pass --model."
+                "No model configured. Set ANTHROPIC_MODEL / FORGE_MODEL, or pass --model."
             )
-        from forge.models.anthropic import AnthropicProvider
+        from forge.providers.anthropic import AnthropicProvider
 
         return AnthropicProvider(
             model=settings.model,
             base_url=settings.base_url,
             auth_token=settings.auth_token,
             api_key=settings.api_key,
+            timeout=settings.request_timeout,
         )
 
     if provider == "fake":
         return FakeProvider(model=settings.model or "fake-model")
 
     raise ValueError(
-        f"Unknown provider: {settings.provider!r}. Supported: 'anthropic', 'fake'."
+        f"Unknown provider: {settings.provider!r}. "
+        f"Supported: {', '.join(repr(p) for p in SUPPORTED_PROVIDERS)}."
     )

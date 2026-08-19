@@ -1,5 +1,19 @@
-"""Permissions package."""
+"""Permissions package: risk classification and the approval policy."""
 
-from forge.permissions.policy import Decision, PermissionPolicy, PermissionResult
+from forge.permissions.policy import (
+    Approval,
+    Decision,
+    PermissionPolicy,
+    PermissionResult,
+    describe_target,
+)
+from forge.permissions.risk import Risk
 
-__all__ = ["Decision", "PermissionPolicy", "PermissionResult"]
+__all__ = [
+    "Approval",
+    "Decision",
+    "PermissionPolicy",
+    "PermissionResult",
+    "Risk",
+    "describe_target",
+]
