@@ -46,12 +46,20 @@ def configure_logging(level: str = "INFO", *, json: bool | None = None) -> None:
     structlog.configure(
         processors=[*shared, renderer],
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
-        cache_logger_on_first_use=True,
+        logger_factory=structlog.PrintLoggerFactory(),
+        # Resolve sys.stderr at write time rather than caching a logger bound to
+        # whatever the stream happened to be at configure time. A cached logger
+        # keeps writing to a stream that may since have been replaced or closed
+        # (CliRunner, capture fixtures, embedding Forge in another process). The
+        # cost is negligible at the handful of events an agent step emits.
+        cache_logger_on_first_use=False,
     )
     _configured = True
 
 
-def get_logger(name: str = "forge") -> structlog.stdlib.BoundLogger:
+def get_logger(name: str = "forge") -> structlog.types.FilteringBoundLogger:
     """Return a bound structlog logger."""
-    return structlog.get_logger(name)
+    # structlog.get_logger is deliberately untyped (the bound class is chosen at
+    # configure time); name the class we actually configure above.
+    logger: structlog.types.FilteringBoundLogger = structlog.get_logger(name)
+    return logger

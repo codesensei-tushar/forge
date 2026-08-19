@@ -1,6 +1,6 @@
 """Configuration loading with explicit, predictable precedence.
 
-Precedence (highest wins):
+Precedence (highest wins)::
 
     CLI overrides  >  environment  >  ./forge.toml  >  ~/.config/forge/config.toml  >  defaults
 
@@ -13,15 +13,28 @@ from __future__ import annotations
 
 import os
 import tomllib
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
-# Tools that never mutate state and are always safe to auto-run.
-READONLY_TOOLS: frozenset[str] = frozenset(
-    {"read_file", "list_directory", "search_files"}
-)
+
+class ApprovalMode(StrEnum):
+    """How much of the agent's work runs without a human in the loop.
+
+    Read operations are always automatic; the mode governs the rest.
+    """
+
+    CAUTIOUS = "cautious"  # writes and destructive actions both need approval
+    AUTO = "auto"  # writes are automatic; destructive actions need approval
+    YOLO = "yolo"  # everything runs unattended (deny rules still apply)
+
+
+class SandboxMode(StrEnum):
+    NONE = "none"  # run shell commands directly on the host
+    DOCKER = "docker"  # run shell commands in a resource-capped container
+
 
 # Shell command substrings that are always denied, regardless of allow-list.
 DEFAULT_DENY_PATTERNS: tuple[str, ...] = (
@@ -30,13 +43,45 @@ DEFAULT_DENY_PATTERNS: tuple[str, ...] = (
     "rm -rf .",
     "sudo ",
     "git push",
-    "git reset --hard",
     "mkfs",
     "dd if=",
     ":(){",  # fork bomb
     "shutdown",
     "reboot",
-    "> /dev/sda",
+    "> /dev/sd",
+    "chmod -R 777 /",
+)
+
+# Shell command substrings treated as destructive: allowed, but they require
+# approval even in ``auto`` mode because they discard work or mutate the host.
+DEFAULT_DESTRUCTIVE_PATTERNS: tuple[str, ...] = (
+    "rm -r",
+    "rm -f",
+    "rmdir",
+    "git reset --hard",
+    "git clean",
+    "git checkout --",
+    "git restore",
+    "git rebase",
+    "git filter-branch",
+    "git remote",
+    "git tag -d",
+    "git branch -D",
+    "truncate",
+    "shred",
+    "mv /",
+    "chown",
+    "chmod -R",
+    "kill -9",
+    "pkill",
+    "systemctl",
+    "docker rm",
+    "docker rmi",
+    "npm publish",
+    "pip uninstall",
+    "curl | sh",
+    "| sh",
+    "| bash",
 )
 
 
@@ -49,22 +94,38 @@ class Settings(BaseModel):
     base_url: str | None = None
     auth_token: str | None = None
     api_key: str | None = None
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     temperature: float = 0.0
+    request_timeout: float = 600.0
 
     # --- agent loop ---
-    max_iterations: int = 25
-    # Soft ceiling on estimated context tokens; the loop stops cleanly if exceeded.
+    max_iterations: int = 30
+    # Soft ceiling on estimated context tokens; older tool output is compacted
+    # away when the history crosses it, so long runs degrade instead of dying.
     max_context_tokens: int = 150_000
+    # Retries for *transient* provider failures (429/5xx/timeouts) per step.
+    max_provider_retries: int = 3
+    retry_base_delay: float = 1.0
 
     # --- tools ---
     workspace_root: Path = Field(default_factory=Path.cwd)
     shell_timeout: int = 120
+    tool_timeout: int = 300
+    enable_git_tools: bool = True
 
     # --- permissions ---
-    auto_approve: bool = False
+    approval_mode: ApprovalMode = ApprovalMode.AUTO
     allow: list[str] = Field(default_factory=list)
     deny: list[str] = Field(default_factory=lambda: list(DEFAULT_DENY_PATTERNS))
+    destructive: list[str] = Field(default_factory=lambda: list(DEFAULT_DESTRUCTIVE_PATTERNS))
+
+    # --- sandbox ---
+    sandbox: SandboxMode = SandboxMode.NONE
+    sandbox_image: str = "python:3.12-slim"
+    sandbox_cpus: float = 2.0
+    sandbox_memory: str = "2g"
+    sandbox_network: bool = False
+    sandbox_pids_limit: int = 512
 
     # --- observability ---
     # Step events go to stderr; WARNING keeps the UI clean. --verbose raises this.
@@ -81,6 +142,16 @@ class Settings(BaseModel):
     def _clamp_temperature(cls, v: float) -> float:
         return max(0.0, min(1.0, v))
 
+    @field_validator("log_level")
+    @classmethod
+    def _upper_log_level(cls, v: str) -> str:
+        return v.upper()
+
+    @property
+    def auto_approve(self) -> bool:
+        """True when nothing requires a human (``yolo`` mode)."""
+        return self.approval_mode is ApprovalMode.YOLO
+
 
 def user_config_path() -> Path:
     """Return the per-user config file path (respects ``XDG_CONFIG_HOME``)."""
@@ -92,12 +163,19 @@ def user_config_path() -> Path:
 def _read_toml(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
-    with path.open("rb") as fh:
-        data = tomllib.load(fh)
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError(f"Could not read config {path}: {exc}") from exc
     # Accept either a flat table or a [forge] section.
     if "forge" in data and isinstance(data["forge"], dict):
         return dict(data["forge"])
     return dict(data)
+
+
+def _as_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_overrides() -> dict[str, Any]:
@@ -116,28 +194,53 @@ def _env_overrides() -> dict[str, Any]:
                 return env[name]
         return None
 
-    if (v := first("FORGE_PROVIDER")) is not None:
-        out["provider"] = v
-    if (v := first("FORGE_MODEL", "ANTHROPIC_MODEL")) is not None:
-        out["model"] = v
-    if (v := first("FORGE_BASE_URL", "ANTHROPIC_BASE_URL")) is not None:
-        out["base_url"] = v
-    if (v := first("ANTHROPIC_AUTH_TOKEN")) is not None:
-        out["auth_token"] = v
-    if (v := first("ANTHROPIC_API_KEY")) is not None:
-        out["api_key"] = v
-    if (v := first("FORGE_MAX_TOKENS")) is not None:
-        out["max_tokens"] = int(v)
-    if (v := first("FORGE_TEMPERATURE")) is not None:
-        out["temperature"] = float(v)
-    if (v := first("FORGE_MAX_ITERATIONS")) is not None:
-        out["max_iterations"] = int(v)
-    if (v := first("FORGE_SHELL_TIMEOUT")) is not None:
-        out["shell_timeout"] = int(v)
+    str_keys = {
+        "provider": ("FORGE_PROVIDER",),
+        "model": ("FORGE_MODEL", "ANTHROPIC_MODEL"),
+        "base_url": ("FORGE_BASE_URL", "ANTHROPIC_BASE_URL"),
+        "auth_token": ("FORGE_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"),
+        "api_key": ("FORGE_API_KEY", "ANTHROPIC_API_KEY"),
+        "approval_mode": ("FORGE_APPROVAL_MODE",),
+        "sandbox": ("FORGE_SANDBOX",),
+        "sandbox_image": ("FORGE_SANDBOX_IMAGE",),
+        "sandbox_memory": ("FORGE_SANDBOX_MEMORY",),
+    }
+    int_keys = {
+        "max_tokens": ("FORGE_MAX_TOKENS",),
+        "max_iterations": ("FORGE_MAX_ITERATIONS",),
+        "max_context_tokens": ("FORGE_MAX_CONTEXT_TOKENS",),
+        "shell_timeout": ("FORGE_SHELL_TIMEOUT",),
+        "tool_timeout": ("FORGE_TOOL_TIMEOUT",),
+    }
+    float_keys = {
+        "temperature": ("FORGE_TEMPERATURE",),
+        "request_timeout": ("FORGE_REQUEST_TIMEOUT",),
+        "sandbox_cpus": ("FORGE_SANDBOX_CPUS",),
+    }
+    bool_keys = {
+        "log_json": ("FORGE_LOG_JSON",),
+        "sandbox_network": ("FORGE_SANDBOX_NETWORK",),
+        "enable_git_tools": ("FORGE_ENABLE_GIT_TOOLS",),
+    }
+
+    for key, names in str_keys.items():
+        if (v := first(*names)) is not None:
+            out[key] = v
+    for key, names in int_keys.items():
+        if (v := first(*names)) is not None:
+            out[key] = int(v)
+    for key, names in float_keys.items():
+        if (v := first(*names)) is not None:
+            out[key] = float(v)
+    for key, names in bool_keys.items():
+        if (v := first(*names)) is not None:
+            out[key] = _as_bool(v)
+
     if (v := first("FORGE_LOG_LEVEL")) is not None:
         out["log_level"] = v.upper()
-    if (v := first("FORGE_AUTO_APPROVE")) is not None:
-        out["auto_approve"] = v.lower() in {"1", "true", "yes", "on"}
+    # Legacy toggle: FORGE_AUTO_APPROVE=1 is shorthand for yolo mode.
+    if (v := first("FORGE_AUTO_APPROVE")) is not None and _as_bool(v):
+        out["approval_mode"] = ApprovalMode.YOLO.value
     return out
 
 
@@ -162,8 +265,11 @@ def load_settings(
     # The active workspace is a runtime fact, not a stored preference.
     merged.setdefault("workspace_root", workspace)
 
-    # Deny patterns from config extend, rather than replace, the built-in guards.
+    # Deny and destructive patterns from config EXTEND the built-in guards
+    # rather than replacing them, so a config file cannot weaken the defaults.
     if "deny" in merged:
-        merged["deny"] = list(DEFAULT_DENY_PATTERNS) + list(merged["deny"])
+        merged["deny"] = [*DEFAULT_DENY_PATTERNS, *merged["deny"]]
+    if "destructive" in merged:
+        merged["destructive"] = [*DEFAULT_DESTRUCTIVE_PATTERNS, *merged["destructive"]]
 
     return Settings(**merged)
