@@ -14,7 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from forge.tools.base import Tool, ToolResult
+from forge.tools.base import Risk, Tool, ToolResult
 from forge.tools.context import PathOutsideWorkspaceError, ToolContext
 
 # Directories that are noise for search/listing.
@@ -123,6 +123,12 @@ def apply_unified_diff(original: str, patch: str) -> str:
 # --------------------------------------------------------------------------- #
 class ReadFileArgs(BaseModel):
     path: str = Field(description="Path to the file, relative to the workspace root.")
+    offset: int = Field(
+        default=0, ge=0, description="Line number to start reading from (0-based). For large files."
+    )
+    limit: int | None = Field(
+        default=None, description="Maximum number of lines to return. Omit to read to the end."
+    )
     max_bytes: int = Field(
         default=_READ_LIMIT,
         description="Maximum number of characters to return before truncating.",
@@ -131,8 +137,11 @@ class ReadFileArgs(BaseModel):
 
 class ReadFile(Tool[ReadFileArgs]):
     name = "read_file"
-    description = "Read a UTF-8 text file and return its contents."
-    read_only = True
+    description = (
+        "Read a UTF-8 text file and return its contents. Supports offset/limit for "
+        "reading a slice of a large file."
+    )
+    risk = Risk.READ
     Args = ReadFileArgs
 
     async def run(self, args: ReadFileArgs, ctx: ToolContext) -> ToolResult:
@@ -150,12 +159,28 @@ class ReadFile(Tool[ReadFileArgs]):
             return ToolResult.error(f"Could not read {args.path}: {exc}")
         if _looks_binary(data):
             return ToolResult.error(f"{args.path} appears to be a binary file")
+
         text = data.decode("utf-8", errors="replace")
-        truncated = len(text) > args.max_bytes
-        if truncated:
+        notes: list[str] = []
+
+        if args.offset or args.limit is not None:
+            lines = text.splitlines()
+            total = len(lines)
+            if args.offset >= total and total:
+                return ToolResult.error(
+                    f"offset {args.offset} is past the end of {args.path} ({total} lines)"
+                )
+            end = total if args.limit is None else min(total, args.offset + args.limit)
+            text = "\n".join(lines[args.offset : end])
+            if args.offset or end < total:
+                notes.append(f"[lines {args.offset + 1}-{end} of {total}]")
+
+        if len(text) > args.max_bytes:
             text = text[: args.max_bytes]
-        suffix = "\n\n[... truncated ...]" if truncated else ""
-        return ToolResult.ok(text + suffix, truncated=truncated, bytes=len(data))
+            notes.append("[... truncated ...]")
+
+        body = text if not notes else f"{text}\n\n{' '.join(notes)}"
+        return ToolResult.ok(body, truncated=bool(notes), bytes=len(data))
 
 
 class WriteFileArgs(BaseModel):
@@ -166,7 +191,7 @@ class WriteFileArgs(BaseModel):
 class WriteFile(Tool[WriteFileArgs]):
     name = "write_file"
     description = "Create or overwrite a file with the given contents."
-    read_only = False
+    risk = Risk.WRITE
     Args = WriteFileArgs
 
     async def run(self, args: WriteFileArgs, ctx: ToolContext) -> ToolResult:
@@ -202,7 +227,7 @@ class EditFile(Tool[EditFileArgs]):
         "Replace an exact string in a file. Fails if old_string is missing, or "
         "matches more than once and replace_all is false."
     )
-    read_only = False
+    risk = Risk.WRITE
     Args = EditFileArgs
 
     async def run(self, args: EditFileArgs, ctx: ToolContext) -> ToolResult:
@@ -247,7 +272,7 @@ class ApplyPatchArgs(BaseModel):
 class ApplyPatch(Tool[ApplyPatchArgs]):
     name = "apply_patch"
     description = "Apply unified-diff hunks to an existing file (exact context match)."
-    read_only = False
+    risk = Risk.WRITE
     Args = ApplyPatchArgs
 
     async def run(self, args: ApplyPatchArgs, ctx: ToolContext) -> ToolResult:
@@ -278,7 +303,7 @@ class ListDirectoryArgs(BaseModel):
 class ListDirectory(Tool[ListDirectoryArgs]):
     name = "list_directory"
     description = "List directory contents (optionally recursive)."
-    read_only = True
+    risk = Risk.READ
     Args = ListDirectoryArgs
 
     async def run(self, args: ListDirectoryArgs, ctx: ToolContext) -> ToolResult:
@@ -305,9 +330,7 @@ class ListDirectory(Tool[ListDirectoryArgs]):
                 if capped:
                     break
         else:
-            children = sorted(
-                root.iterdir(), key=lambda p: (p.is_file(), p.name.lower())
-            )
+            children = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
             for child in children:
                 if child.is_dir():
                     entries.append(f"{child.name}/")
@@ -337,7 +360,7 @@ class SearchFilesArgs(BaseModel):
 class SearchFiles(Tool[SearchFilesArgs]):
     name = "search_files"
     description = "Search file contents by regex, returning 'path:line: text' matches."
-    read_only = True
+    risk = Risk.READ
     Args = SearchFilesArgs
 
     async def run(self, args: SearchFilesArgs, ctx: ToolContext) -> ToolResult:
@@ -387,7 +410,7 @@ class SearchFiles(Tool[SearchFilesArgs]):
         return ToolResult.ok(body, count=len(results), truncated=capped)
 
 
-def _walk(root: Path) -> "list[tuple[str, list[str], list[str]]]":
+def _walk(root: Path) -> list[tuple[str, list[str], list[str]]]:
     """os.walk over ``root`` with ignore-dirs pruned. Returns a materialized list."""
     import os
 
