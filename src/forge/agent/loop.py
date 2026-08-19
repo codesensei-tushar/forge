@@ -1,43 +1,91 @@
-"""The agent runtime: a robust observe -> decide -> approve -> execute loop.
+"""The agent runtime: a robust build -> call -> execute -> observe loop.
 
-Deliberately more than ``while True: llm()``:
-- model input is validated against each tool's schema before execution;
-- every tool runs inside try/except so a failure feeds an error back to the
-  model instead of crashing the run;
-- permission decisions gate mutating calls (allow / deny / ask-a-human);
-- hard guards on iteration count and estimated context size;
-- graceful Ctrl-C and provider-error handling;
-- every step is recorded to a RunTrace for the end-of-run summary.
+Deliberately more than ``while True: llm()``. The loop's job is to keep making
+forward progress in the presence of every ordinary failure:
+
+- **Bad model input** — arguments are validated against each tool's schema
+  before execution, and a schema violation returns an error the model can fix.
+- **Failing tools** — a crash, timeout, or non-zero exit becomes a structured
+  error *result*, so the model sees what happened and can recover.
+- **Refused actions** — the permission policy gates writes and destructive
+  actions; a denial tells the model to change approach rather than retry.
+- **Flaky providers** — transient 429s/5xx/timeouts are retried with backoff
+  instead of ending the run.
+- **A full context window** — old tool output is compacted away rather than
+  aborting the task at the worst possible moment.
+- **Runaway loops** — a hard iteration ceiling, always.
+
+Everything the run did is recorded on a :class:`RunTrace` for the summary and
+for ``--json``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import ValidationError
-
+from forge.agent.context import ContextManager, gather_environment
 from forge.agent.prompts import build_system_prompt
 from forge.agent.state import AgentState
 from forge.config import Settings
 from forge.logging import get_logger
-from forge.models.base import ModelProvider, ProviderError
-from forge.models.registry import create_provider
-from forge.models.types import ModelResponse, ToolResultBlock, ToolUseBlock
 from forge.observability.trace import RunTrace
-from forge.permissions.policy import Decision, PermissionPolicy
-from forge.tools import ToolContext, ToolRegistry, default_registry
-from forge.tools.base import ToolResult
-from forge.ui.console import Approval, Console
+from forge.permissions.policy import PermissionPolicy
+from forge.providers.base import ModelProvider, ProviderError
+from forge.providers.registry import create_provider
+from forge.providers.types import ModelResponse, ToolResultBlock, ToolUseBlock
+from forge.sandbox import create_sandbox
+from forge.tools import ToolContext, ToolExecutor, ToolRegistry, default_registry
+from forge.ui.console import Console, console_approver
+
+# How many times the model may be asked to continue after being cut off by the
+# output-token limit, before we accept the truncated answer and stop.
+_MAX_CONTINUATIONS = 3
+
+_CONTINUE_NUDGE = (
+    "Your previous message was cut off by the output token limit. "
+    "Continue from exactly where you stopped. Do not repeat what you already said."
+)
+
+
+class RunStatus:
+    """Terminal states for a task. Only ``COMPLETED`` means the model finished."""
+
+    COMPLETED = "completed"
+    MAX_ITERATIONS = "max_iterations"
+    REFUSED = "refused"
+    ERROR = "error"
+    ABORTED = "aborted"
 
 
 @dataclass
 class AgentResult:
-    status: str  # completed | max_iterations | max_context | error | aborted
+    status: str
     final_text: str
     trace: RunTrace
     state: AgentState
+
+    @property
+    def ok(self) -> bool:
+        return self.status == RunStatus.COMPLETED
+
+    @property
+    def exit_code(self) -> int:
+        """Process exit status: 0 success, 130 interrupted, 1 anything else."""
+        if self.ok:
+            return 0
+        return 130 if self.status == RunStatus.ABORTED else 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "ok": self.ok,
+            "response": self.final_text,
+            "iterations": self.state.iterations,
+            "trace": self.trace.to_dict(),
+        }
 
 
 class AgentRuntime:
@@ -46,172 +94,210 @@ class AgentRuntime:
         *,
         provider: ModelProvider,
         registry: ToolRegistry,
-        policy: PermissionPolicy,
+        executor: ToolExecutor,
         ctx: ToolContext,
         console: Console,
         settings: Settings,
     ) -> None:
         self.provider = provider
         self.registry = registry
-        self.policy = policy
+        self.executor = executor
         self.ctx = ctx
         self.console = console
         self.settings = settings
+        self.context = ContextManager(max_tokens=settings.max_context_tokens)
         self.log = get_logger("forge.agent")
+        self._tools_schema: list[dict[str, Any]] | None = None
+        self._system_prompt: str | None = None
 
+    # ----------------------------------------------------------------- setup
+    async def system_prompt(self) -> str:
+        """Build the system prompt once per runtime, including workspace facts."""
+        if self._system_prompt is None:
+            environment = await gather_environment(self.ctx)
+            self._system_prompt = build_system_prompt(self.registry, environment=environment)
+        return self._system_prompt
+
+    def tools_schema(self) -> list[dict[str, Any]]:
+        if self._tools_schema is None:
+            self._tools_schema = self.registry.to_provider_schema()
+        return self._tools_schema
+
+    async def new_state(self) -> AgentState:
+        return AgentState(system_prompt=await self.system_prompt())
+
+    # ------------------------------------------------------------------ loop
     async def run_task(self, task: str, state: AgentState | None = None) -> AgentResult:
+        """Run one task to completion, reusing ``state`` to continue a session."""
         if state is None:
-            state = AgentState(
-                system_prompt=build_system_prompt(
-                    self.registry, workspace=str(self.ctx.workspace_root)
-                )
-            )
+            state = await self.new_state()
         state.add_user(task)
+
         trace = RunTrace(task=task)
-        tools_schema = self.registry.to_provider_schema()
         budget = self.settings.max_iterations
-        start_iter = state.iterations
-        status = "running"
+        start_iteration = state.iterations
+        continuations = 0
+        status = RunStatus.MAX_ITERATIONS
         final_text = ""
 
         try:
-            while state.iterations - start_iter < budget:
+            while state.iterations - start_iteration < budget:
                 state.iterations += 1
 
-                if state.estimate_tokens() > self.settings.max_context_tokens:
-                    self.console.warning(
-                        "Context ceiling reached; stopping. (Compaction arrives in Phase 4.)"
-                    )
-                    status = "max_context"
-                    break
+                if self.context.over_budget(state):
+                    reclaimed = self.context.compact(state)
+                    trace.compactions += 1
+                    self.console.info(f"Compacted context (~{reclaimed:,} tokens reclaimed).")
+                    self.log.info("context_compacted", reclaimed_tokens=reclaimed)
 
-                response = await self._complete(state, tools_schema, trace)
+                response = await self._complete(state, trace)
                 state.add_message(response.to_message())
+                state.record_usage(response.usage)
 
-                text = response.text()
-                if text:
+                if text := response.text().strip():
                     self.console.assistant_text(text)
                     final_text = text
 
-                tool_uses = response.tool_uses()
-                if not tool_uses:
-                    status = "completed"
+                if response.stop_reason == "refusal":
+                    status = RunStatus.REFUSED
+                    final_text = final_text or "The model declined to continue with this task."
+                    self.console.warning(final_text)
                     break
 
-                results = [await self._execute_tool_use(tu, trace) for tu in tool_uses]
-                state.add_tool_results(results)
+                tool_uses = response.tool_uses()
+                if tool_uses:
+                    results = await self._run_tools(tool_uses, trace)
+                    state.add_tool_results(results)
+                    continue
+
+                # No tools requested. Either the model is done, or it ran out of
+                # output tokens mid-sentence and deserves a chance to finish.
+                if response.truncated and continuations < _MAX_CONTINUATIONS:
+                    continuations += 1
+                    self.console.info("Response hit the output limit; asking it to continue.")
+                    state.add_user(_CONTINUE_NUDGE)
+                    continue
+
+                status = RunStatus.COMPLETED
+                break
             else:
-                status = "max_iterations"
-                self.console.warning(f"Reached max iterations ({budget}).")
-        except KeyboardInterrupt:
-            status = "aborted"
-            self.console.warning("Aborted by user.")
+                self.console.warning(
+                    f"Stopped after {budget} iterations without finishing. "
+                    "Re-run with --max-iterations to allow more, or narrow the task."
+                )
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            status = RunStatus.ABORTED
+            self.console.warning("Aborted.")
         except ProviderError as exc:
-            status = "error"
+            status = RunStatus.ERROR
             final_text = str(exc)
             self.console.error(str(exc))
 
         trace.finish(status)
         self.console.run_summary(trace)
-        self.log.info("run_finished", status=status, iterations=state.iterations - start_iter)
+        self.log.info(
+            "run_finished",
+            status=status,
+            iterations=state.iterations - start_iteration,
+            tool_calls=trace.num_tool_calls,
+        )
         return AgentResult(status=status, final_text=final_text, trace=trace, state=state)
 
-    async def _complete(
-        self, state: AgentState, tools_schema: list[dict[str, Any]], trace: RunTrace
-    ) -> ModelResponse:
-        t0 = time.perf_counter()
-        with self.console.status("thinking..."):
-            response = await self.provider.complete(
-                system=state.system_prompt,
-                messages=state.messages,
-                tools=tools_schema,
-                max_tokens=self.settings.max_tokens,
-                temperature=self.settings.temperature,
-            )
-        latency = time.perf_counter() - t0
-        trace.record_model_call(
-            model=response.model or self.provider.model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            latency_s=latency,
-            stop_reason=response.stop_reason,
-        )
-        self.log.info(
-            "model_call",
-            latency_s=round(latency, 2),
-            stop_reason=response.stop_reason,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-        return response
+    # --------------------------------------------------------------- helpers
+    async def _complete(self, state: AgentState, trace: RunTrace) -> ModelResponse:
+        """One model call, retrying transient provider failures with backoff."""
+        attempts = max(1, self.settings.max_provider_retries)
+        last_error: ProviderError | None = None
 
-    async def _execute_tool_use(self, tu: ToolUseBlock, trace: RunTrace) -> ToolResultBlock:
-        self.console.tool_call(tu.name, tu.input)
-        tool = self.registry.get(tu.name)
-        if tool is None:
-            msg = f"Unknown tool: {tu.name}"
-            self.console.error(msg)
-            trace.record_tool_call(name=tu.name, decision="deny", duration_s=0.0, is_error=True)
-            return ToolResultBlock(tool_use_id=tu.id, content=msg, is_error=True)
-
-        perm = self.policy.decide(tool, tu.input)
-        if perm.decision is Decision.DENY:
-            self.console.denied(tu.name, perm.reason)
-            trace.record_tool_call(name=tu.name, decision="deny", duration_s=0.0, is_error=True)
-            return ToolResultBlock(
-                tool_use_id=tu.id,
-                content=f"Denied by policy ({perm.reason}). Do not retry; try another approach.",
-                is_error=True,
-            )
-
-        decision_label = "allow"
-        if perm.decision is Decision.ASK:
-            target = str(tu.input.get("command") or tu.input.get("path") or tu.name)
-            approval = self.console.ask_approval(tu.name, target, perm)
-            if approval is Approval.DENY:
-                self.console.denied(tu.name, "denied by user")
-                trace.record_tool_call(
-                    name=tu.name, decision="deny", duration_s=0.0, is_error=True
-                )
-                return ToolResultBlock(
-                    tool_use_id=tu.id,
-                    content="Denied by the user. Do not retry the same action; "
-                    "consider an alternative or ask what to do instead.",
-                    is_error=True,
-                )
-            if approval is Approval.ALWAYS:
-                self.policy.always_allow_tool(tu.name)
-            decision_label = "ask->allow"
-
-        t0 = time.perf_counter()
-        try:
-            args = tool.parse_args(tu.input)
-        except ValidationError as exc:
-            result = ToolResult.error(f"Invalid arguments for {tu.name}: {exc}")
-        else:
+        for attempt in range(attempts):
+            started = time.perf_counter()
             try:
-                result = await tool.run(args, self.ctx)
-            except Exception as exc:  # noqa: BLE001 - never let a tool crash the loop
-                self.log.warning("tool_crashed", tool=tu.name, error=repr(exc))
-                result = ToolResult.error(f"Tool {tu.name} raised an exception: {exc!r}")
-        duration = time.perf_counter() - t0
+                with self.console.status("thinking..."):
+                    response = await self.provider.complete(
+                        system=state.system_prompt,
+                        messages=state.messages,
+                        tools=self.tools_schema(),
+                        max_tokens=self.settings.max_tokens,
+                        temperature=self.settings.temperature,
+                    )
+            except ProviderError as exc:
+                last_error = exc
+                if not exc.retryable or attempt == attempts - 1:
+                    raise
+                delay = self.settings.retry_base_delay * (2**attempt)
+                self.console.warning(
+                    f"{exc} — retrying in {delay:.0f}s (attempt {attempt + 2}/{attempts})."
+                )
+                self.log.warning("provider_retry", attempt=attempt + 1, delay_s=delay)
+                await asyncio.sleep(delay)
+                continue
 
-        self.console.tool_result(tu.name, result)
-        trace.record_tool_call(
-            name=tu.name, decision=decision_label, duration_s=duration, is_error=result.is_error
-        )
-        return ToolResultBlock(
-            tool_use_id=tu.id, content=result.content, is_error=result.is_error
-        )
+            latency = time.perf_counter() - started
+            trace.record_model_call(
+                model=response.model or self.provider.model,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                latency_s=latency,
+                stop_reason=response.stop_reason,
+                retries=attempt,
+            )
+            self.log.info(
+                "model_call",
+                latency_s=round(latency, 2),
+                stop_reason=response.stop_reason,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+            )
+            return response
+
+        # Unreachable: the final attempt either returns or re-raises.
+        raise last_error or ProviderError("Model call failed with no response")
+
+    async def _run_tools(
+        self, tool_uses: list[ToolUseBlock], trace: RunTrace
+    ) -> list[ToolResultBlock]:
+        """Execute requested tools in order.
+
+        Order is preserved deliberately: a batch is usually "edit, then run the
+        tests", and running those concurrently would race.
+        """
+        blocks: list[ToolResultBlock] = []
+        for tool_use in tool_uses:
+            self.console.tool_call(tool_use.name, tool_use.input)
+            outcome = await self.executor.execute(tool_use)
+            self.console.tool_outcome(outcome)
+            trace.record_tool_call(
+                name=outcome.name,
+                decision=outcome.decision,
+                duration_s=outcome.duration_s,
+                is_error=outcome.is_error,
+                risk=outcome.risk.value,
+            )
+            blocks.append(outcome.block)
+        return blocks
+
+    async def aclose(self) -> None:
+        await self.provider.aclose()
+        await self.ctx.aclose()
 
 
 def build_runtime(settings: Settings, console: Console) -> AgentRuntime:
-    """Assemble a runtime from settings (provider, tools, policy, context)."""
+    """Assemble a runtime from settings: provider, sandbox, tools, policy, UI."""
+    registry = default_registry(settings)
+    policy = PermissionPolicy(settings)
+    ctx = ToolContext(settings, sandbox=create_sandbox(settings))
+    executor = ToolExecutor(
+        registry=registry,
+        policy=policy,
+        ctx=ctx,
+        settings=settings,
+        approver=console_approver(console),
+    )
     return AgentRuntime(
         provider=create_provider(settings),
-        registry=default_registry(),
-        policy=PermissionPolicy(settings),
-        ctx=ToolContext(settings),
+        registry=registry,
+        executor=executor,
+        ctx=ctx,
         console=console,
         settings=settings,
     )
